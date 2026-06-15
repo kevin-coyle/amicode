@@ -1,0 +1,12 @@
+# Build output
+/build/
+/amicode
+*.o
+
+# Editor / OS cruft
+*~
+.DS_Store
+
+# Local secrets — never commit the API key
+ENV/
+*.key
