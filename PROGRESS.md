@@ -125,4 +125,31 @@ progress.
 **Acceptance (hardware):** tokens appear live as Claude replies; tool calls and
 web_search still work under streaming; output readable on an 80-col Shell.
 `-n` gives the old buffered behaviour.
-## Phase 6 — Optional niceties  ⬜
+## Phase 6 — Optional niceties (no GUI)  🔨 in progress
+Batch A built (v0.1.0):
+- **Config file** `amicode.config` (current dir): `model`, `max_tokens`,
+  `approve` (ask|allow|never), `stream` (on|off). Parsed in main.c.
+- **Approval policy**: `tools_approval_mode` (APPROVE_ASK/ALLOW/DENY) in
+  tools.c; `approve()` honours it. `-n` flag still overrides streaming.
+- **Project context**: reads `AMICODE.md` / `AGENTS.md` from the current dir
+  into the system prompt (`build_system_prompt`, 32 KB cap).
+- **Download progress**: `conn_read_all` prints "received N KB" so a working
+  transfer no longer looks hung. (A true read timeout needs WaitSelect —
+  Roadshow headers lack SO_RCVTIMEO/timeval — deferred; revisit if it actually
+  stalls vs just-slow.)
+- `to_utf8` moved to `api.c` as `api_to_utf8` (exposed) and now also UTF-8s the
+  system prompt (so AMICODE.md with Latin-1 bytes is safe).
+
+### web_search pairing fix (v0.1.1)
+"server_tool_use ... without a corresponding web_search_tool_result block",
+intermittent + unrecoverable. Cause: on `pause_turn`, the paused assistant turn
+(holding the server_tool_use) and the continuation (holding the result) were
+stored as TWO assistant messages, breaking the required same-message pairing.
+Fix in `agent.c`: `conv_run_turn` now keeps one in-progress assistant turn and
+**merges** pause_turn continuations into it (`begin_assistant_turn` /
+`merge_into_assistant_turn`), and `sanitize_server_tools` drops any orphan
+server_tool_use at turn finalization (safety net for truncated streams) so a
+broken turn can't poison the whole session.
+
+Batch B (next): **ARexx port** — public message port "AMICODE", run prompts via
+ARexx and return RESULT.

@@ -13,6 +13,14 @@
 #include <exec/types.h>
 #include "json/cJSON.h"
 
+/* Approval policy for write_file / run_command / download_file. */
+#define APPROVE_ASK    0   /* prompt y/N on the console (default) */
+#define APPROVE_ALLOW  1   /* auto-approve everything             */
+#define APPROVE_DENY   2   /* auto-decline everything             */
+
+/* Current approval policy; set from config/flags by main. Default APPROVE_ASK. */
+extern int tools_approval_mode;
+
 /* Build the Anthropic "tools" array (name/description/input_schema per tool).
  * Caller owns the returned cJSON (cJSON_Delete). NULL on allocation failure. */
 cJSON *tools_definitions(void);

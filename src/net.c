@@ -569,10 +569,13 @@ static BOOL conn_write_all(struct Conn *c, const UBYTE *buf, LONG len)
     return TRUE;
 }
 
-/* Read until the peer closes. Binary-safe; NUL-terminates for header parsing. */
+/* Read until the peer closes. Binary-safe; NUL-terminates for header parsing.
+ * Prints running byte progress (downloads can be large/slow) and stops on a
+ * read timeout instead of hanging forever. */
 static UBYTE *conn_read_all(struct Conn *c, LONG *out_len)
 {
-    LONG cap = 16384, len = 0;
+    LONG cap = 16384, len = 0, next_mark = 65536;
+    BOOL progressed = FALSE;
     UBYTE *buf = malloc(cap);
 
     if (!buf)
@@ -589,10 +592,25 @@ static UBYTE *conn_read_all(struct Conn *c, LONG *out_len)
         }
         n = c->ssl ? SSL_read(c->ssl, buf + len, 8192)
                    : (int)recv(c->sock, buf + len, 8192, 0);
-        if (n <= 0)
+        if (n == 0)
+            break;                          /* clean close: complete */
+        if (n < 0)
+        {
+            /* timeout (SO_RCVTIMEO) or connection error */
+            Printf("\n  (read timed out or connection dropped)\n");
             break;
+        }
         len += n;
+        if (len >= next_mark)
+        {
+            Printf("\r  received %ld KB ", (long)(len / 1024));
+            Flush(Output());
+            progressed = TRUE;
+            next_mark += 65536;
+        }
     }
+    if (progressed)
+        Printf("\n");
     buf[len] = '\0';
     *out_len = len;
     return buf;

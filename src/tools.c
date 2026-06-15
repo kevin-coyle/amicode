@@ -60,9 +60,22 @@ static char *dup_msg(const char *msg)
 
 /* ---- approval gate ------------------------------------------------------- */
 
+int tools_approval_mode = APPROVE_ASK;
+
 static BOOL approve(const char *summary)
 {
     char line[64];
+
+    if (tools_approval_mode == APPROVE_ALLOW)
+    {
+        Printf("  [auto-approved] %s\n", (LONG)summary);
+        return TRUE;
+    }
+    if (tools_approval_mode == APPROVE_DENY)
+    {
+        Printf("  [auto-declined] %s\n", (LONG)summary);
+        return FALSE;
+    }
 
     Printf("\n  [approve] %s\n  Proceed? (y/N) ", (LONG)summary);
     Flush(Output());
@@ -256,7 +269,7 @@ static char *tool_run_command(const cJSON *input, BOOL *is_error)
     LONG rc;
     char *output;
     const char *err;
-    LONG olen;
+    LONG olen, ioerr;
     struct sbuf s;
     char hdr[64];
 
@@ -273,15 +286,17 @@ static char *tool_run_command(const cJSON *input, BOOL *is_error)
 
     /* Synchronous System(): it does NOT close the streams we pass, so we do.
      * SYS_UserShell runs the command through the user's real Shell so streams
-     * are inherited properly, redirection works, and script/alias handling
-     * matches an interactive Shell — without it some commands run detached or
-     * in their own console and their output can't be captured here. */
+     * are inherited properly. SYS_Error points the error stream at the SAME
+     * temp file as SYS_Output, so stderr is captured too (the AmigaDOS
+     * equivalent of 2>&1) — the model never needs Unix-style 2> redirection. */
     rc = SystemTags((STRPTR)cmd,
                     SYS_Input,     (ULONG)in,
                     SYS_Output,    (ULONG)out,
+                    SYS_Error,     (ULONG)out,
                     SYS_UserShell, TRUE,
                     SYS_Asynch,    FALSE,
                     TAG_DONE);
+    ioerr = IoErr();   /* capture before Close()/Read change it */
 
     Close(out);
     if (in) Close(in);
@@ -301,6 +316,19 @@ static char *tool_run_command(const cJSON *input, BOOL *is_error)
 
     sprintf(hdr, "exit code %ld\n", (long)rc);
     sb_puts(&s, hdr);
+
+    /* On failure, translate the AmigaDOS secondary error into a readable line
+     * so the model sees *why* it failed even if the command printed nothing. */
+    if (rc != 0 && ioerr != 0)
+    {
+        char fault[120];
+        if (Fault(ioerr, (STRPTR)"reason", (STRPTR)fault, sizeof(fault)) && fault[0])
+        {
+            sb_puts(&s, fault);
+            sb_puts(&s, "\n");
+        }
+    }
+
     if (output && olen > 0)
     {
         sb_append(&s, output, olen);
@@ -352,6 +380,142 @@ static char *tool_download_file(const cJSON *input, BOOL *is_error)
     return dup_msg(result);
 }
 
+/* ---- edit_file (exact-string partial edit) ------------------------------- */
+
+/* The model sees files as UTF-8 (read_file converts), but they live on disk as
+ * Latin-1. Convert the model's UTF-8 strings back to Latin-1 so they match the
+ * raw file bytes; codepoints outside Latin-1 become '?'. */
+static char *utf8_to_latin1(const char *in)
+{
+    const unsigned char *p = (const unsigned char *)in;
+    LONG  n = (LONG)strlen(in), i = 0, o = 0;
+    char *out = malloc(n + 1);
+
+    if (!out)
+        return NULL;
+
+    while (i < n)
+    {
+        unsigned char c = p[i];
+        if (c < 0x80)
+        {
+            out[o++] = (char)c; i++;
+        }
+        else if ((c & 0xE0) == 0xC0 && i + 1 < n && (p[i + 1] & 0xC0) == 0x80)
+        {
+            unsigned int cp = ((c & 0x1F) << 6) | (p[i + 1] & 0x3F);
+            out[o++] = (cp <= 0xFF) ? (char)cp : '?';
+            i += 2;
+        }
+        else if ((c & 0xF0) == 0xE0) { out[o++] = '?'; i += 3; }
+        else if ((c & 0xF8) == 0xF0) { out[o++] = '?'; i += 4; }
+        else                         { out[o++] = '?'; i += 1; }
+    }
+    out[o] = '\0';
+    return out;
+}
+
+static LONG count_occ(const char *hay, const char *needle)
+{
+    LONG n = 0, nl = (LONG)strlen(needle);
+    const char *p = hay;
+    if (nl == 0)
+        return 0;
+    while ((p = strstr(p, needle)) != NULL) { n++; p += nl; }
+    return n;
+}
+
+/* Replace every occurrence of `old` with `new` in `hay`; returns malloc'd. */
+static char *replace_all_occ(const char *hay, const char *old, const char *new)
+{
+    struct sbuf s;
+    const char *p = hay;
+    LONG ol = (LONG)strlen(old);
+
+    if (!sb_init(&s))
+        return NULL;
+    for (;;)
+    {
+        const char *m = strstr(p, old);
+        if (!m) { sb_puts(&s, p); break; }
+        sb_append(&s, p, (LONG)(m - p));
+        sb_puts(&s, new);
+        p = m + ol;
+    }
+    return s.data;
+}
+
+static char *tool_edit_file(const cJSON *input, BOOL *is_error)
+{
+    cJSON *p  = cJSON_GetObjectItemCaseSensitive((cJSON *)input, "path");
+    cJSON *o  = cJSON_GetObjectItemCaseSensitive((cJSON *)input, "old_string");
+    cJSON *nw = cJSON_GetObjectItemCaseSensitive((cJSON *)input, "new_string");
+    cJSON *ra = cJSON_GetObjectItemCaseSensitive((cJSON *)input, "replace_all");
+    const char *path, *err;
+    char *raw = NULL, *oldl = NULL, *newl = NULL, *result = NULL;
+    LONG  rawlen, occ, rlen, wrote;
+    BOOL  replace_all;
+    BPTR  fh;
+    char  summary[300], res[200];
+
+    if (!cJSON_IsString(p) || !cJSON_IsString(o) || !cJSON_IsString(nw))
+    { *is_error = TRUE; return dup_msg("edit_file: needs path, old_string, new_string"); }
+    path = p->valuestring;
+    replace_all = cJSON_IsTrue(ra);
+
+    if (o->valuestring[0] == '\0')
+    { *is_error = TRUE; return dup_msg("edit_file: old_string is empty"); }
+
+    if (!(raw = read_whole_file(path, &rawlen, &err)))
+    { *is_error = TRUE; return dup_msg("edit_file: couldn't read file"); }
+
+    oldl = utf8_to_latin1(o->valuestring);
+    newl = utf8_to_latin1(nw->valuestring);
+    if (!oldl || !newl)
+    { free(raw); free(oldl); free(newl); *is_error = TRUE; return dup_msg("out of memory"); }
+
+    occ = count_occ(raw, oldl);
+    if (occ == 0)
+    {
+        free(raw); free(oldl); free(newl); *is_error = TRUE;
+        return dup_msg("edit_file: old_string not found (it must match the file "
+                       "exactly, including whitespace)");
+    }
+    if (occ > 1 && !replace_all)
+    {
+        free(raw); free(oldl); free(newl); *is_error = TRUE;
+        sprintf(res, "edit_file: old_string matches %ld places; add surrounding "
+                     "context to make it unique, or set replace_all=true",
+                (long)occ);
+        return dup_msg(res);
+    }
+
+    result = replace_all_occ(raw, oldl, newl);
+    free(raw);
+    if (!result)
+    { free(oldl); free(newl); *is_error = TRUE; return dup_msg("out of memory"); }
+
+    sprintf(summary, "edit_file: %ld change(s) in %s", (long)occ, path);
+    if (!approve(summary))
+    { free(result); free(oldl); free(newl); *is_error = TRUE;
+      return dup_msg("edit declined by user"); }
+
+    if (!(fh = Open((STRPTR)path, MODE_NEWFILE)))
+    { free(result); free(oldl); free(newl); *is_error = TRUE;
+      return dup_msg("edit_file: couldn't open file for writing"); }
+    rlen  = (LONG)strlen(result);
+    wrote = Write(fh, (APTR)result, rlen);
+    Close(fh);
+    free(result); free(oldl); free(newl);
+
+    if (wrote != rlen)
+    { *is_error = TRUE; return dup_msg("edit_file: short write (disk full?)"); }
+
+    sprintf(res, "Edited %s (%ld replacement%s)",
+            path, (long)occ, occ == 1 ? "" : "s");
+    return dup_msg(res);
+}
+
 /* ---- dispatch ------------------------------------------------------------ */
 
 char *tools_execute(const char *name, const cJSON *input, BOOL *is_error)
@@ -360,6 +524,7 @@ char *tools_execute(const char *name, const cJSON *input, BOOL *is_error)
 
     if (strcmp(name, "read_file")     == 0) return tool_read_file(input, is_error);
     if (strcmp(name, "write_file")    == 0) return tool_write_file(input, is_error);
+    if (strcmp(name, "edit_file")     == 0) return tool_edit_file(input, is_error);
     if (strcmp(name, "list_dir")      == 0) return tool_list_dir(input, is_error);
     if (strcmp(name, "run_command")   == 0) return tool_run_command(input, is_error);
     if (strcmp(name, "download_file") == 0) return tool_download_file(input, is_error);
@@ -418,10 +583,63 @@ cJSON *tools_definitions(void)
         NULL, NULL);
 
     add_tool(arr, "write_file",
-        "Create or overwrite a file with text content. The user is asked to "
-        "approve before anything is written.",
+        "Create or overwrite a whole file with text content. The user is asked "
+        "to approve before anything is written. For changing PART of an "
+        "existing file, prefer edit_file.",
         "path", "AmigaDOS path to write, e.g. RAM:hello.txt",
         "content", "The full text to write to the file");
+
+    /* edit_file: exact-string partial edit (path, old_string, new_string,
+     * optional replace_all). Built by hand since add_tool only does 2 props. */
+    {
+        cJSON *tool   = cJSON_CreateObject();
+        cJSON *schema = cJSON_CreateObject();
+        cJSON *props  = cJSON_CreateObject();
+        cJSON *req    = cJSON_CreateArray();
+        cJSON *pp, *po, *pn, *pr;
+
+        cJSON_AddStringToObject(tool, "name", "edit_file");
+        cJSON_AddStringToObject(tool, "description",
+            "Make a partial edit to an existing text file by replacing an exact "
+            "string with a new one, without rewriting the whole file. Prefer "
+            "this over write_file for changing part of a file. old_string must "
+            "match the file exactly (including whitespace/indentation) and be "
+            "unique unless replace_all is true; include enough surrounding "
+            "context to identify the spot. The user is asked to approve.");
+
+        pp = cJSON_CreateObject();
+        cJSON_AddStringToObject(pp, "type", "string");
+        cJSON_AddStringToObject(pp, "description", "AmigaDOS path of the file to edit");
+        cJSON_AddItemToObject(props, "path", pp);
+
+        po = cJSON_CreateObject();
+        cJSON_AddStringToObject(po, "type", "string");
+        cJSON_AddStringToObject(po, "description",
+            "Exact text to find, with enough surrounding context to be unique");
+        cJSON_AddItemToObject(props, "old_string", po);
+
+        pn = cJSON_CreateObject();
+        cJSON_AddStringToObject(pn, "type", "string");
+        cJSON_AddStringToObject(pn, "description",
+            "Replacement text (may be empty to delete the matched text)");
+        cJSON_AddItemToObject(props, "new_string", pn);
+
+        pr = cJSON_CreateObject();
+        cJSON_AddStringToObject(pr, "type", "boolean");
+        cJSON_AddStringToObject(pr, "description",
+            "Replace every occurrence instead of requiring old_string to be unique");
+        cJSON_AddItemToObject(props, "replace_all", pr);
+
+        cJSON_AddItemToArray(req, cJSON_CreateString("path"));
+        cJSON_AddItemToArray(req, cJSON_CreateString("old_string"));
+        cJSON_AddItemToArray(req, cJSON_CreateString("new_string"));
+
+        cJSON_AddStringToObject(schema, "type", "object");
+        cJSON_AddItemToObject(schema, "properties", props);
+        cJSON_AddItemToObject(schema, "required", req);
+        cJSON_AddItemToObject(tool, "input_schema", schema);
+        cJSON_AddItemToArray(arr, tool);
+    }
 
     add_tool(arr, "list_dir",
         "List the entries (name, size, dir/file) in a directory.",
@@ -429,7 +647,11 @@ cJSON *tools_definitions(void)
         NULL, NULL);
 
     add_tool(arr, "run_command",
-        "Run an AmigaDOS Shell command and return its output. The user is "
+        "Run an AmigaDOS Shell command and return its output. Both stdout and "
+        "stderr are captured automatically, along with the exit code and (on "
+        "failure) the AmigaDOS error reason. This is AmigaDOS, NOT Unix: do not "
+        "use 2>, 2>&1, pipes (|), &&, or ; - they are not supported. AmigaDOS "
+        "redirection is '>file' (output) and '<file' (input) only. The user is "
         "asked to approve before the command runs.",
         "command", "The command line to run, e.g. \"list RAM:\" or \"version\"",
         NULL, NULL);

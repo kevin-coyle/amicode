@@ -52,6 +52,12 @@ const char *api_error_message(const cJSON *response);
  * bare string `container`), or NULL. Points into `response`; do not free. */
 const char *api_response_container_id(const cJSON *response);
 
+/* Convert Latin-1 (ISO-8859-1) text to valid UTF-8 for the request body: byte
+ * runs that are already valid UTF-8 pass through unchanged, stray high bytes
+ * are encoded as Latin-1. Idempotent on valid UTF-8. Returns a malloc'd string
+ * (caller frees), or NULL on allocation failure. */
+char *api_to_utf8(const char *in);
+
 /* Concatenate the text of every `text` block in an assistant response's
  * `content` array. Returns a malloc'd string (caller frees), or NULL if there
  * is no text content. */

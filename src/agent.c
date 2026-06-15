@@ -13,58 +13,11 @@
  * for multi-step tasks; still bounds a runaway loop. */
 #define MAX_TOOL_ROUNDS  100
 
-/* The Anthropic API requires the JSON request body to be valid UTF-8, but the
- * Amiga is a Latin-1 (ISO-8859-1) machine: file contents, command output and
- * keyboard input routinely contain bytes >= 0x80 that are not valid UTF-8.
- * Convert to UTF-8, passing through byte runs that are already valid UTF-8 and
- * encoding stray high bytes as Latin-1. Returns a malloc'd string (caller
- * frees), or NULL on allocation failure. */
-static char *to_utf8(const char *in)
-{
-    const unsigned char *p = (const unsigned char *)in;
-    LONG  n = (LONG)strlen(in), i = 0, o = 0;
-    char *out = malloc(n * 2 + 1);
-
-    if (!out)
-        return NULL;
-
-    while (i < n)
-    {
-        unsigned char c = p[i];
-        int len = 0;
-
-        if (c < 0x80) { out[o++] = (char)c; i++; continue; }
-
-        if      ((c & 0xE0) == 0xC0) len = 2;
-        else if ((c & 0xF0) == 0xE0) len = 3;
-        else if ((c & 0xF8) == 0xF0) len = 4;
-
-        if (len && i + len <= n)
-        {
-            int k, ok = 1;
-            for (k = 1; k < len; k++)
-                if ((p[i + k] & 0xC0) != 0x80) { ok = 0; break; }
-            if (ok)
-            {
-                for (k = 0; k < len; k++) out[o++] = (char)p[i + k];
-                i += len;
-                continue;
-            }
-        }
-
-        /* Not valid UTF-8 here: treat the byte as Latin-1. */
-        out[o++] = (char)(0xC0 | (c >> 6));
-        out[o++] = (char)(0x80 | (c & 0x3F));
-        i++;
-    }
-    out[o] = '\0';
-    return out;
-}
-
-/* cJSON_AddStringToObject with Latin-1 -> UTF-8 conversion of the value. */
+/* cJSON_AddStringToObject with Latin-1 -> UTF-8 conversion of the value
+ * (see api_to_utf8: the API requires UTF-8, the Amiga is Latin-1). */
 static void add_utf8_string(cJSON *obj, const char *key, const char *val)
 {
-    char *u = to_utf8(val);
+    char *u = api_to_utf8(val);
     cJSON_AddStringToObject(obj, key, u ? u : val);
     if (u) free(u);
 }
@@ -80,7 +33,13 @@ BOOL conv_init(struct Conversation *c, const char *api_key, const char *system)
 
     c->cfg.api_key    = api_key;
     c->cfg.model      = API_DEFAULT_MODEL;
-    c->cfg.max_tokens = 2048;
+    /* A file written via write_file is generated entirely as output tokens
+     * inside the tool call, so a low cap truncates large writes (forcing
+     * retries / temp-file workarounds). Default to the model's maximum output:
+     * claude-sonnet-4-6 allows 64K, and streaming (which we always do) removes
+     * the timeout concern. If you switch to an Opus model (128K) via
+     * amicode.config, raise max_tokens there to use the extra headroom. */
+    c->cfg.max_tokens = 64000;
     c->cfg.system     = system;
     c->cfg.tools      = c->tools;
     c->stream         = TRUE;
@@ -105,21 +64,160 @@ BOOL conv_add_user_text(struct Conversation *c, const char *text)
     return TRUE;
 }
 
-/* Append the assistant's reply to the history, preserving its full content
- * array (text and tool_use blocks) so the model sees its own turns. */
-static void append_assistant_turn(struct Conversation *c, const cJSON *response)
+/* Does `content` hold a *_tool_result block whose tool_use_id == id? */
+static BOOL has_result_for(cJSON *content, const char *id)
+{
+    cJSON *b;
+    cJSON_ArrayForEach(b, content)
+    {
+        cJSON *t = cJSON_GetObjectItemCaseSensitive(b, "type");
+        if (cJSON_IsString(t) && strstr(t->valuestring, "tool_result"))
+        {
+            cJSON *tid = cJSON_GetObjectItemCaseSensitive(b, "tool_use_id");
+            if (cJSON_IsString(tid) && strcmp(tid->valuestring, id) == 0)
+                return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* Drop any server_tool_use block (web_search/web_fetch) that has no matching
+ * web_search_tool_result in the same assistant turn. A truncated stream or a
+ * mishandled pause can otherwise leave an orphan that the API rejects forever
+ * ("server_tool_use ... without a corresponding ..._tool_result block"),
+ * poisoning every subsequent request. */
+static void sanitize_server_tools(cJSON *content)
+{
+    cJSON *b;
+
+    if (!cJSON_IsArray(content))
+        return;
+    b = content->child;
+    while (b)
+    {
+        cJSON *next = b->next;
+        cJSON *t    = cJSON_GetObjectItemCaseSensitive(b, "type");
+        if (cJSON_IsString(t) && strcmp(t->valuestring, "server_tool_use") == 0)
+        {
+            cJSON *id = cJSON_GetObjectItemCaseSensitive(b, "id");
+            if (!cJSON_IsString(id) || !has_result_for(content, id->valuestring))
+            {
+                cJSON_DetachItemViaPointer(content, b);
+                cJSON_Delete(b);
+            }
+        }
+        b = next;
+    }
+}
+
+/* Self-heal: guarantee the API's invariant that every tool_use in an assistant
+ * message has a matching tool_result in the next (user) message. Inject a
+ * synthetic error result for any that are missing. Runs before every request,
+ * so a malformed turn from ANY cause can't make every future request fail and
+ * silently burn credits. A no-op on healthy history. */
+static void repair_history(cJSON *messages)
+{
+    int i = 0;
+    int count = cJSON_GetArraySize(messages);
+
+    while (i < count)
+    {
+        cJSON *msg  = cJSON_GetArrayItem(messages, i);
+        cJSON *role = cJSON_GetObjectItemCaseSensitive(msg, "role");
+        cJSON *content, *next_content = NULL, *block, *missing = NULL;
+
+        if (!cJSON_IsString(role) || strcmp(role->valuestring, "assistant") != 0)
+        { i++; continue; }
+        content = cJSON_GetObjectItemCaseSensitive(msg, "content");
+        if (!cJSON_IsArray(content))
+        { i++; continue; }
+
+        if (i + 1 < count)
+        {
+            cJSON *next  = cJSON_GetArrayItem(messages, i + 1);
+            cJSON *nrole = cJSON_GetObjectItemCaseSensitive(next, "role");
+            if (cJSON_IsString(nrole) && strcmp(nrole->valuestring, "user") == 0)
+                next_content = cJSON_GetObjectItemCaseSensitive(next, "content");
+        }
+
+        cJSON_ArrayForEach(block, content)
+        {
+            cJSON *t  = cJSON_GetObjectItemCaseSensitive(block, "type");
+            cJSON *id = cJSON_GetObjectItemCaseSensitive(block, "id");
+            if (!cJSON_IsString(t) || strcmp(t->valuestring, "tool_use") != 0)
+                continue;
+            if (!cJSON_IsString(id))
+                continue;
+            if (cJSON_IsArray(next_content) &&
+                has_result_for(next_content, id->valuestring))
+                continue;
+
+            if (!missing)
+                missing = cJSON_CreateArray();
+            {
+                cJSON *tr = cJSON_CreateObject();
+                cJSON_AddStringToObject(tr, "type", "tool_result");
+                cJSON_AddStringToObject(tr, "tool_use_id", id->valuestring);
+                cJSON_AddStringToObject(tr, "content",
+                    "(no result was recorded for this tool call)");
+                cJSON_AddBoolToObject(tr, "is_error", 1);
+                cJSON_AddItemToArray(missing, tr);
+            }
+        }
+
+        if (missing)
+        {
+            if (cJSON_IsArray(next_content))
+            {
+                cJSON *m;
+                while ((m = missing->child) != NULL)
+                {
+                    cJSON_DetachItemViaPointer(missing, m);
+                    cJSON_AddItemToArray(next_content, m);
+                }
+                cJSON_Delete(missing);
+            }
+            else
+            {
+                cJSON *um = cJSON_CreateObject();
+                cJSON_AddStringToObject(um, "role", "user");
+                cJSON_AddItemToObject(um, "content", missing);
+                cJSON_InsertItemInArray(messages, i + 1, um);
+                count++;
+            }
+        }
+        i++;
+    }
+}
+
+/* Start a new assistant turn in history from `response`, returning the stored
+ * message object (so pause_turn continuations can be merged into it). */
+static cJSON *begin_assistant_turn(struct Conversation *c, const cJSON *response)
 {
     cJSON *content = cJSON_GetObjectItemCaseSensitive((cJSON *)response, "content");
     cJSON *msg     = cJSON_CreateObject();
     if (!msg)
-        return;
+        return NULL;
 
     cJSON_AddStringToObject(msg, "role", "assistant");
-    if (cJSON_IsArray(content))
-        cJSON_AddItemToObject(msg, "content", cJSON_Duplicate(content, 1));
-    else
-        cJSON_AddStringToObject(msg, "content", "");
+    cJSON_AddItemToObject(msg, "content",
+        cJSON_IsArray(content) ? cJSON_Duplicate(content, 1) : cJSON_CreateArray());
     cJSON_AddItemToArray(c->messages, msg);
+    return msg;
+}
+
+/* Merge a pause_turn continuation's content blocks into the existing turn so a
+ * server_tool_use and its result stay in one assistant message. */
+static void merge_into_assistant_turn(cJSON *msg, const cJSON *response)
+{
+    cJSON *dst = cJSON_GetObjectItemCaseSensitive(msg, "content");
+    cJSON *src = cJSON_GetObjectItemCaseSensitive((cJSON *)response, "content");
+    cJSON *blk;
+
+    if (!cJSON_IsArray(dst) || !cJSON_IsArray(src))
+        return;
+    cJSON_ArrayForEach(blk, src)
+        cJSON_AddItemToArray(dst, cJSON_Duplicate(blk, 1));
 }
 
 /* Print a one-line note for each server-side tool use (web_search / web_fetch
@@ -230,7 +328,8 @@ static cJSON *run_tool_uses(const cJSON *response)
 
 char *conv_run_turn(struct Conversation *c, const char **err_out)
 {
-    int round;
+    int    round;
+    cJSON *assistant = NULL;   /* in-progress assistant turn (merged across pauses) */
 
     if (err_out)
         *err_out = NULL;
@@ -241,6 +340,9 @@ char *conv_run_turn(struct Conversation *c, const char **err_out)
         const char *apierr;
         cJSON      *stop;
         cJSON      *tool_msg;
+
+        /* Belt-and-suspenders: never send a history with a dangling tool_use. */
+        repair_history(c->messages);
 
         response = c->stream ? api_create_message_streaming(&c->cfg, c->messages)
                              : api_create_message(&c->cfg, c->messages);
@@ -260,12 +362,16 @@ char *conv_run_turn(struct Conversation *c, const char **err_out)
             return NULL;
         }
 
-        append_assistant_turn(c, response);
+        /* Start a new assistant turn, or merge a pause_turn continuation into
+         * the existing one so a server_tool_use and its web_search_tool_result
+         * stay in the SAME assistant message (the API requires them paired). */
+        if (assistant == NULL)
+            assistant = begin_assistant_turn(c, response);
+        else
+            merge_into_assistant_turn(assistant, response);
 
-        /* Server-side code execution (web_search/web_fetch dynamic filtering)
-         * creates a container; capture its id so the resume request can reuse
-         * it — otherwise the API rejects the follow-up ("container_id is
-         * required when there are pending tool uses"). */
+        /* Server-side code execution (web_search dynamic filtering) creates a
+         * container; capture its id so a resume request can reuse it. */
         {
             const char *cid = api_response_container_id(response);
             if (cid && cid[0] && strcmp(cid, c->container) != 0)
@@ -283,9 +389,9 @@ char *conv_run_turn(struct Conversation *c, const char **err_out)
 
         stop = cJSON_GetObjectItemCaseSensitive(response, "stop_reason");
 
-        /* Server-side tools (web_search/web_fetch) paused the turn after the
-         * built-in iteration cap. The assistant turn (with its server_tool_use
-         * + result blocks) is already in history; just re-send to resume. */
+        /* Server-side tools paused the turn after their iteration cap. Keep the
+         * same assistant turn open and re-send to resume; the continuation's
+         * result blocks will be merged into it next round. */
         if (cJSON_IsString(stop) && strcmp(stop->valuestring, "pause_turn") == 0)
         {
             if (c->stream) print_server_activity(response);
@@ -294,25 +400,30 @@ char *conv_run_turn(struct Conversation *c, const char **err_out)
             continue;
         }
 
-        if (cJSON_IsString(stop) && strcmp(stop->valuestring, "tool_use") == 0)
-        {
-            /* Show any narration, run the tools, feed results back, loop. */
-            if (c->stream) print_server_activity(response);
-            else           print_text_blocks(response);
-            tool_msg = run_tool_uses(response);
-            cJSON_Delete(response);
+        /* The assistant turn is now complete; drop any orphan server_tool_use
+         * (e.g. from a truncated stream) before it can poison later requests. */
+        if (assistant)
+            sanitize_server_tools(
+                cJSON_GetObjectItemCaseSensitive(assistant, "content"));
+        assistant = NULL;
 
-            if (!tool_msg)
-            {
-                strcpy(c->last_error, "stop_reason was tool_use but no tool calls found");
-                if (err_out) *err_out = c->last_error;
-                return NULL;
-            }
+        /* Show narration, then decide by the PRESENCE of tool_use blocks rather
+         * than trusting stop_reason: if the assistant called any client tool we
+         * MUST send back a tool_result for each, or the API rejects every later
+         * request ("tool_use ids without tool_result blocks"). run_tool_uses
+         * returns NULL only when there are no client tool calls. */
+        if (c->stream) print_server_activity(response);
+        else           print_text_blocks(response);
+
+        tool_msg = run_tool_uses(response);
+        if (tool_msg)
+        {
+            cJSON_Delete(response);
             cJSON_AddItemToArray(c->messages, tool_msg);
             continue;
         }
 
-        /* Final turn: return the assistant's text. */
+        /* No client tool calls -> this is the final answer. */
         {
             char *text = api_response_text(response);
             cJSON_Delete(response);

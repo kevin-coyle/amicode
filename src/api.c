@@ -9,6 +9,47 @@
 #include "api.h"
 #include "net.h"
 
+char *api_to_utf8(const char *in)
+{
+    const unsigned char *p = (const unsigned char *)in;
+    LONG  n = (LONG)strlen(in), i = 0, o = 0;
+    char *out = malloc(n * 2 + 1);
+
+    if (!out)
+        return NULL;
+
+    while (i < n)
+    {
+        unsigned char c = p[i];
+        int len = 0;
+
+        if (c < 0x80) { out[o++] = (char)c; i++; continue; }
+
+        if      ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+
+        if (len && i + len <= n)
+        {
+            int k, ok = 1;
+            for (k = 1; k < len; k++)
+                if ((p[i + k] & 0xC0) != 0x80) { ok = 0; break; }
+            if (ok)
+            {
+                for (k = 0; k < len; k++) out[o++] = (char)p[i + k];
+                i += len;
+                continue;
+            }
+        }
+
+        out[o++] = (char)(0xC0 | (c >> 6));
+        out[o++] = (char)(0x80 | (c & 0x3F));
+        i++;
+    }
+    out[o] = '\0';
+    return out;
+}
+
 /* Build the "x-api-key / anthropic-version / content-type" header block. */
 static char *build_headers(const char *api_key)
 {
@@ -38,7 +79,11 @@ static char *build_body(const struct ApiConfig *cfg, cJSON *messages, BOOL strea
     cJSON_AddNumberToObject(root, "max_tokens",
                             (double)(cfg->max_tokens > 0 ? cfg->max_tokens : 1024));
     if (cfg->system)
-        cJSON_AddStringToObject(root, "system", cfg->system);
+    {
+        char *sys = api_to_utf8(cfg->system);
+        cJSON_AddStringToObject(root, "system", sys ? sys : cfg->system);
+        if (sys) free(sys);
+    }
     cJSON_AddItemReferenceToObject(root, "messages", messages);
     if (cfg->tools)
         cJSON_AddItemReferenceToObject(root, "tools", cfg->tools);
