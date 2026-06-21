@@ -199,6 +199,17 @@ Some AmigaOS 3.x details are easy to break:
 The AmiSSL SDK examples, especially its HTTPS example and OS3 autoinit glue,
 are useful references when changing the transport layer.
 
+## Releases
+
+Pushing a tag prefixed with `v`, such as `v0.1.0`, runs the GitHub release
+workflow. It builds with `OPTFLAGS=-O2`, packages the AmigaOS 3.x m68k binary,
+publishes a GitHub Release, and uploads checksums.
+
+The workflow needs access to vbcc, the AmiSSL SDK, and Roadshow netinclude
+headers. For a preinstalled runner, configure `RELEASE_RUNNER`, `VBCC`,
+`AMISSL_SDK`, and `NET_INC` repository variables. For GitHub-hosted runners,
+provide a private toolchain archive through the `AMICODE_TOOLCHAIN_URL` secret.
+
 ## Third-Party Code
 
 `src/json/` contains cJSON, which is MIT licensed. Its copyright and license

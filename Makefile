@@ -26,7 +26,9 @@ INCLUDES    = -I$(AMISSL_SDK)/include -I$(NET_INC) -Isrc -Isrc/json
 
 # -c99 for modern C; warnings on. Link amiga.lib for RangeRand(); mieee.lib for
 # the IEEE double math (strtod/fabs/MathIeeeDoubBas) that cJSON's numbers need.
-CFLAGS      = $(TARGET_CFG) -c99 -O1 $(INCLUDES)
+# Override OPTFLAGS for release builds, e.g. `make OPTFLAGS=-O2`.
+OPTFLAGS   ?= -O1
+CFLAGS      = $(TARGET_CFG) -c99 $(OPTFLAGS) $(INCLUDES)
 LDFLAGS     = $(TARGET_CFG) -lmieee -lamiga
 
 BIN         = amicode

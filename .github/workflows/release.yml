@@ -1,0 +1,183 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  # For a preinstalled/self-hosted runner, set these repository variables.
+  # For GitHub-hosted runners, set AMICODE_TOOLCHAIN_URL to a tar/zip archive
+  # containing vbcc, the AmiSSL SDK, and the Roadshow netinclude directory.
+  VBCC: ${{ vars.VBCC || '/opt/vbcc' }}
+  AMISSL_SDK: ${{ vars.AMISSL_SDK || '/opt/amissl-sdk/AmiSSL/Developer' }}
+  NET_INC: ${{ vars.NET_INC || '/opt/vbcc/NDK3.2/SANA+RoadshowTCP-IP/netinclude' }}
+  AMICODE_TOOLCHAIN_URL: ${{ secrets.AMICODE_TOOLCHAIN_URL }}
+  AMICODE_TOOLCHAIN_AUTH_HEADER: ${{ secrets.AMICODE_TOOLCHAIN_AUTH_HEADER }}
+
+jobs:
+  release:
+    name: Build AmigaOS 3.x m68k release
+    runs-on: ${{ vars.RELEASE_RUNNER || 'ubuntu-latest' }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install host archive tools
+        run: |
+          set -euo pipefail
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo_cmd=()
+            if command -v sudo >/dev/null 2>&1; then
+              sudo_cmd=(sudo)
+            fi
+            "${sudo_cmd[@]}" apt-get update
+            "${sudo_cmd[@]}" apt-get install -y unzip zip xz-utils
+          fi
+
+      - name: Resolve Amiga release toolchain
+        run: |
+          set -euo pipefail
+
+          have_toolchain() {
+            [ -x "$VBCC/bin/vc" ] &&
+            [ -d "$AMISSL_SDK/include" ] &&
+            [ -d "$NET_INC" ]
+          }
+
+          if have_toolchain; then
+            echo "Using configured toolchain paths."
+            exit 0
+          fi
+
+          if [ -z "${AMICODE_TOOLCHAIN_URL:-}" ]; then
+            cat >&2 <<'EOF'
+          Release toolchain not found.
+
+          Configure either:
+            - repository variables VBCC, AMISSL_SDK, and NET_INC pointing at a preinstalled toolchain, or
+            - secret AMICODE_TOOLCHAIN_URL pointing at a tar/zip archive containing:
+                * vbcc/bin/vc
+                * AmiSSL/Developer/include
+                * a Roadshow netinclude directory
+
+          If the URL needs authentication, set AMICODE_TOOLCHAIN_AUTH_HEADER to
+          a curl header such as: Authorization: Bearer <token>
+          EOF
+            exit 1
+          fi
+
+          toolroot="$RUNNER_TEMP/amicode-toolchain"
+          archive="$toolroot/toolchain.archive"
+          mkdir -p "$toolroot"
+
+          curl_args=(-fsSL)
+          if [ -n "${AMICODE_TOOLCHAIN_AUTH_HEADER:-}" ]; then
+            curl_args+=(-H "$AMICODE_TOOLCHAIN_AUTH_HEADER")
+          fi
+          curl "${curl_args[@]}" "$AMICODE_TOOLCHAIN_URL" -o "$archive"
+
+          url_path="${AMICODE_TOOLCHAIN_URL%%\?*}"
+          case "$url_path" in
+            *.tar.gz|*.tgz)  tar -xzf "$archive" -C "$toolroot" ;;
+            *.tar.xz|*.txz)  tar -xJf "$archive" -C "$toolroot" ;;
+            *.tar.bz2|*.tbz2) tar -xjf "$archive" -C "$toolroot" ;;
+            *.tar)           tar -xf "$archive" -C "$toolroot" ;;
+            *.zip)           unzip -q "$archive" -d "$toolroot" ;;
+            *)
+              echo "::error::AMICODE_TOOLCHAIN_URL must point at a .tar, .tar.gz, .tar.xz, .tar.bz2, or .zip archive."
+              exit 1
+              ;;
+          esac
+
+          vc_path="$(find "$toolroot" -type f -path '*/bin/vc' -print -quit)"
+          amissl_include="$(find "$toolroot" -type d -path '*/AmiSSL/Developer/include' -print -quit)"
+          netinclude="$(find "$toolroot" -type d -name netinclude -print -quit)"
+
+          if [ -z "$vc_path" ] || [ -z "$amissl_include" ] || [ -z "$netinclude" ]; then
+            echo "::error::Could not locate vbcc/bin/vc, AmiSSL/Developer/include, and netinclude inside the toolchain archive."
+            exit 1
+          fi
+
+          vbcc_dir="$(dirname "$(dirname "$vc_path")")"
+          amissl_dir="${amissl_include%/include}"
+
+          chmod +x "$vbcc_dir"/bin/* || true
+
+          {
+            echo "VBCC=$vbcc_dir"
+            echo "AMISSL_SDK=$amissl_dir"
+            echo "NET_INC=$netinclude"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify toolchain inputs
+        run: |
+          set -euo pipefail
+          test -x "$VBCC/bin/vc"
+          test -d "$AMISSL_SDK/include"
+          test -d "$NET_INC"
+          "$VBCC/bin/vc" +a1200 -v || true
+
+      - name: Build release binary
+        run: |
+          set -euo pipefail
+          make clean
+          make OPTFLAGS=-O2 VBCC="$VBCC" AMISSL_SDK="$AMISSL_SDK" NET_INC="$NET_INC"
+          test -x amicode
+
+      - name: Package release assets
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          asset_base="amicode-${tag}-amigaos3-m68k"
+          dist="$PWD/dist"
+          package_root="$RUNNER_TEMP/$asset_base"
+
+          rm -rf "$dist" "$package_root"
+          mkdir -p "$dist" "$package_root"
+
+          install -m 755 amicode "$package_root/amicode"
+          cp README.md LICENSE "$package_root/"
+          cat > "$package_root/BUILDINFO.txt" <<EOF
+          amicode $tag
+          commit: $GITHUB_SHA
+          target: AmigaOS 3.x m68k
+          built: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          EOF
+
+          install -m 755 amicode "$dist/$asset_base"
+          tar -C "$RUNNER_TEMP" -czf "$dist/$asset_base.tar.gz" "$asset_base"
+          (cd "$RUNNER_TEMP" && zip -9 -r "$dist/$asset_base.zip" "$asset_base")
+          (cd "$dist" && sha256sum "$asset_base" "$asset_base.tar.gz" "$asset_base.zip" > SHA256SUMS.txt)
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: amicode-${{ github.ref_name }}-release
+          path: |
+            dist/amicode-*
+            dist/SHA256SUMS.txt
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          notes="Release build for AmigaOS 3.x m68k.
+
+          Built from ${GITHUB_SHA}."
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/amicode-* dist/SHA256SUMS.txt --clobber
+          else
+            gh release create "$tag" dist/amicode-* dist/SHA256SUMS.txt \
+              --title "amicode $tag" \
+              --notes "$notes"
+          fi
